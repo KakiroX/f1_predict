@@ -1,0 +1,8 @@
+numpy>=1.26
+pandas>=2.2
+requests>=2.31
+# optional
+matplotlib>=3.8      # charts in report.md
+faster-whisper>=1.0  # transcribe
+websockets>=12       # record (live Polymarket order book)
+pytest>=8
