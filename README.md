@@ -13,6 +13,27 @@ measures how much the price moved between "a fast trader could know" and
 > use synthetic fixtures to check the code; they say nothing about the markets.
 > Run the commands below on a machine with internet access.
 
+## Before you run: network access
+
+The pipeline needs HTTPS access to these hosts:
+
+| Host | Used for |
+|---|---|
+| `livetiming.formula1.com` | F1 archive: radio clips, publish times, track status, laps |
+| `api.openf1.org` | optional cross-check of radio timestamps |
+| `gamma-api.polymarket.com` | Polymarket event and market lookup |
+| `data-api.polymarket.com` | Polymarket trades |
+| `clob.polymarket.com` | Polymarket 1-minute price history |
+| `ws-subscriptions-clob.polymarket.com` | live Polymarket order book (`record` only) |
+| `api.elections.kalshi.com` | Kalshi events, trades and candles |
+
+On your own machine this usually just works. In a Claude Code cloud
+environment, open the environment's settings (cloud environment menu in the
+session title bar, then Edit), go to Network access, and add these hosts under
+Allowed domains (or pick a broader access level). Leave "Allow package
+managers" ticked. Steps:
+<https://code.claude.com/docs/en/cloud-environments#network-access>.
+
 ## The timing chain
 
 ```
@@ -46,7 +67,9 @@ python -m f1radio fetch --year 2026 --race singapore
 
 # 2. Radio audio + transcripts (check and correct the transcripts by hand)
 python -m f1radio audio --year 2026 --race baku
-python -m f1radio transcribe --year 2026 --race baku     # writes data/2026_baku/transcripts.csv
+python -m f1radio transcribe --year 2026 --race baku     # optional; writes data/2026_baku/transcripts.csv
+#    Machine transcripts of radio are rough. Fix them by hand before trusting the tags,
+#    or skip `transcribe` and type transcripts into that CSV yourself.
 
 # 3. When did each clip air? Either from a recording of the broadcast...
 python -m f1radio align --year 2026 --race baku --recording baku_replay.mp4 \
@@ -65,6 +88,21 @@ Output goes to `data/<year>_<race>/`: `event_study.csv`, `event_summary.csv`,
 `--race` also takes any meeting name ("Monaco", "Las Vegas"), so the same
 commands run on other races. Two races is too few to conclude much, so run it
 on more.
+
+### Market identifiers that are not confirmed
+
+- **Kalshi:** the race-winner series ticker `KXF1RACE` and the event format
+  (`KXF1RACE-MIAGP26` for Miami 2026) come from
+  [third-party listings](https://simplefunctions.dev/markets/miami-grand-prix-winner-lance-stroll-kalshi-kxf1race-miagp26-str),
+  not from Kalshi's docs. The Singapore and Baku codes are not known.
+- **Polymarket:** the exact event names and slugs for F1 winner markets are
+  not known. `fetch` searches for "<race> Grand Prix ... Winner" in the right year.
+- **Polymarket fees:** the backtest assumes 0 fees on Polymarket. Check the
+  fee schedule of the market you trade and pass `--poly-fee-rate`.
+
+If the automatic search misses a market, open it on the website and pass its
+id: `--kalshi-event <event ticker>` or `--poly-slug <slug from the URL>`.
+`fetch` logs every market it could not match to a driver.
 
 ### Tagging messages
 
@@ -128,10 +166,13 @@ These are hypotheses for the pipeline to confirm or reject, not results.
    `move_pre_60s`: if the price already moved before the clip was available,
    faster public data got there first.
 4. **Only a few messages per race matter for the winner market.** They are
-   problems for the leader or for a close second. Singapore 2026 was pole to
-   win for Verstappen by 7.3 s, so expect almost no winner-relevant radio.
-   Baku 2026 is the better test case: Russell beat Verstappen by 0.196 s after
-   two safety cars. Late-race radio about tyres, battery or lift-and-coast for
+   problems for the leader or for a close second.
+   [Singapore 2026](https://www.the-race.com/formula-1/f1-2026-singapore-grand-prix-race-result/)
+   was pole to win for Verstappen by 7.3 s, so expect almost no
+   winner-relevant radio.
+   [Baku 2026](https://www.silverstone.co.uk/news/f1-2026-azerbaijan-grand-prix-results-russell-wins-baku)
+   is the better test case: Russell beat Verstappen by 0.196 s after two
+   safety cars. Late-race radio about tyres, battery or lift-and-coast for
    either of them is what to look at first.
 5. **Liquidity, not signal, sets the ceiling.** In-race winner markets on the
    front-runners can carry real volume, but each news event moves a thin book
