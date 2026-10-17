@@ -34,6 +34,7 @@ class PriceBook:
     def __init__(self, trades: pd.DataFrame, minute: pd.DataFrame, quotes_at: str = "candle_end"):
         """`minute` holds 1-minute candles (quotes_at="candle_end") or live quotes (quotes_at="asof")."""
         self.quotes_at = quotes_at
+        self.quote_mode: dict[tuple[str, int], str] = {}
         self.series: dict[tuple[str, int], pd.DataFrame] = {}
         self.quotes: dict[tuple[str, int], pd.DataFrame] = {}
         if not trades.empty:
@@ -51,6 +52,22 @@ class PriceBook:
                 if {"bid", "ask"} <= set(g.columns) and g["bid"].notna().any():
                     self.quotes[key] = g[["utc", "bid", "ask"]].dropna()
 
+    def add_quotes(self, odds: pd.DataFrame) -> None:
+        """Bookmaker / exchange rows (bookmakers.STANDARD): fair probability, plus bid/ask if executable."""
+        for (venue, drv), g in odds.groupby(["venue", "driver_number"]):
+            g = g.sort_values("utc").assign(utc=lambda x: x["utc"].dt.as_unit("ns"))
+            key = (venue, int(drv))
+            self.series[key] = g[["utc", "yes_price"]].dropna().assign(size=np.nan, notional=np.nan)
+            # Keep blank quotes: an empty book must not fall back to an older, stale price.
+            q = g[["utc", "bid", "ask"]]
+            if q["bid"].notna().any():
+                self.quotes[key] = q
+                self.quote_mode[key] = "asof"
+
+    def has_volume(self, key) -> bool:
+        s = self.series.get(key)
+        return s is not None and s["size"].notna().any()
+
     def keys(self, driver: int) -> list[tuple[str, int]]:
         return [k for k in self.series if k[1] == driver]
 
@@ -66,7 +83,7 @@ class PriceBook:
         q = self.quotes.get(key)
         if q is None or pd.isna(t):
             return np.nan, np.nan
-        if self.quotes_at == "asof":
+        if self.quote_mode.get(key, self.quotes_at) == "asof":
             i = q["utc"].searchsorted(_ns(t), side="right") - 1
         else:
             i = q["utc"].searchsorted(_ns(t), side="left")  # candle stamps are period *ends*

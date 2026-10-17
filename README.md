@@ -1,10 +1,11 @@
 # f1_predict: team radio vs. race-winner markets
 
-Can you make money on Polymarket or Kalshi race-winner markets by acting on a
-team-radio message before the TV broadcast airs it?
+Can you make money on race-winner markets (Polymarket, Kalshi, Betfair, or a
+bookmaker such as Winline) by acting on a team-radio message before the TV
+broadcast airs it?
 
 This repo matches every radio clip from a race (Singapore and Baku 2026 by default)
-to the winner-market prices on Polymarket and Kalshi on one UTC clock. It then
+to the winner prices on each venue on one UTC clock. It then
 measures how much the price moved between "a fast trader could know" and
 "everyone watching TV knows", and backtests trading that gap after spread and fees.
 
@@ -100,13 +101,17 @@ command on one line, without the trailing `\`).
 
 ```bash
 pip install -r requirements.txt          # ffmpeg is also needed for `align`
-python -m pytest                         # 10 tests, no network
+python -m pytest                         # 15 tests, no network
 
 # 1. Race data (F1 archive, or OpenF1 when the archive refuses) + both markets.
 #    Market ids for Baku and Singapore 2026 are built in (see below).
 python -m f1radio fetch --year 2026 --race baku
 python -m f1radio fetch --year 2026 --race singapore
 #    For other races, or to override: --kalshi-event KXF1RACE-<code> --poly-slug <slug>
+
+# 1b. Optional: bookmaker / exchange odds (see "Other bookmakers and exchanges")
+python -m f1radio import-odds --year 2026 --race baku --file winline_baku.csv --bookmaker Winline --tz Europe/Moscow
+python -m f1radio import-betfair --year 2026 --race baku --file 1.234567890.bz2
 
 # 2. Radio audio + transcripts (check and correct the transcripts by hand)
 python -m f1radio audio --year 2026 --race baku
@@ -192,6 +197,77 @@ recording starts. Then `align --wallclock-start ...` gives the moment a viewer
 heard each clip, stream latency included, and `analyze --live data/live/austin26`
 backtests against real bid/ask.
 
+## Other bookmakers and exchanges
+
+Polymarket and Kalshi publish their history. Bookmakers do not, so odds come
+in one of three ways, all saved as `data/<year>_<race>/odds_<name>.csv` and
+picked up by `analyze` automatically:
+
+| Source | Command | What you get |
+|---|---|---|
+| Any bookmaker (Winline, Pinnacle, bet365, ...) | `import-odds --file odds.csv` | whatever you captured |
+| Betfair Exchange history ([historicdata.betfair.com](https://historicdata.betfair.com)) | `import-betfair --file 1.234567.bz2` | best back/lay to the second (ADVANCED/PRO files), last traded price per minute (BASIC) |
+| Betfair Exchange live | `record-betfair --market-id 1.234567 --out bf.csv`, then `import-odds --file bf.csv` | best back/lay every second |
+
+Run `fetch` first: the import matches selection names to drivers using the
+race's driver list.
+
+**CSV format for `import-odds`.** One row per selection per moment; a
+selection's odds are carried forward until its next row.
+
+```
+timestamp,selection,odds,suspended
+2026-09-26T15:31:20,Max Verstappen,1.25,0
+2026-09-26T15:31:20,George Russell,4.00,0
+```
+
+- `selection`: driver name, surname or three-letter code (`VER`).
+- `odds`: decimal (`3.5`), fractional (`5/2`) or American with a sign (`+250`).
+- `timestamp` (or `utc`): naive times are UTC unless you pass `--tz`, e.g.
+  `--tz Europe/Moscow` for times copied from Winline.
+- optional: `bookmaker` (otherwise pass `--bookmaker Winline`), `suspended`
+  (1 while bets are refused), `lay_odds`, `back_size`, `lay_size` (exchanges;
+  a file with `lay_odds` is treated as an exchange).
+- an empty `odds` or `lay_odds` cell means nothing is on offer, not "unchanged".
+
+Odds become probabilities with the bookmaker's margin removed
+proportionally, so the event study compares them with Polymarket and Kalshi
+on the same scale. If you capture only part of the field (the top five, say),
+the implied probabilities sum to less than 1 and are kept unscaled.
+
+**How each kind is backtested.**
+
+- **Exchanges (Betfair)** trade like a prediction market: back = buy YES at
+  1/back odds, lay = sell YES at 1/lay odds, close the position after the
+  broadcast, and pay commission on net winnings (`--exchange-commission`,
+  default 5 %; check your own rate). Imported odds carry no traded volume,
+  so size is not capped (`capacity_known` is false in `backtest.csv`).
+- **Fixed-odds bookmakers** are tested separately in
+  `backtest_bookmakers.csv`, because you cannot sell a bet back:
+  - you can only back. After bad news for a driver, the bet goes on the
+    most likely winner among the others;
+  - the bet is accepted `--acceptance-delay` seconds later (default 7), at
+    the odds then on offer, and refused if the market is suspended at either
+    moment (`status`: `suspended`, `no_odds`, or `accepted_after_broadcast`
+    when the delay outlasts the edge);
+  - stakes are capped at `--max-stake` (default 100), because bookmakers
+    limit in-play bets and accounts that win them;
+  - each bet is valued two ways: `ev_after_broadcast` (the ticket at the
+    bookmaker's own fair price once the clip has aired; this is the measure
+    that does not depend on who won) and `settled_pnl` (the actual result).
+    The winner comes from `--winner <car number>`, a settled Betfair file, or
+    any market pricing a driver at 0.9 or more after the chequered flag.
+
+**Winline specifically.** It has no public API and publishes no odds
+history, so its odds have to be captured during a race, by hand or with your
+own tool, into the CSV format above. Most bookmakers' terms forbid automated
+access, so check Winline's before you script it. A capture every few seconds
+during the decisive laps is enough to see whether Winline suspends or
+re-prices before the clip airs. In the report, watch the `suspended` and
+`mean_odds_drift` columns: if the market closes or the odds have already
+moved by the time your bet would be accepted, there is no edge at that
+bookmaker, whatever the prediction markets show.
+
 ## Is the edge real? What to expect before running it
 
 These are hypotheses for the pipeline to confirm or reject, not results.
@@ -230,10 +306,11 @@ These are hypotheses for the pipeline to confirm or reject, not results.
    change. Kalshi's taker fee is up to 1.75 c per contract at 50 c, so an
    edge has to beat that on both legs.
 
-**Winline** is not in the pipeline. It publishes no historical odds, live bets
-are accepted after a delay of several seconds, markets suspend on incidents,
-and bookmakers limit accounts that win on latency. The only way to test it
-would be to log its live odds yourself during a race.
+**Bookmakers are harder than exchanges.** In-play bets are accepted only
+after a delay of several seconds, markets suspend on incidents, and
+bookmakers limit accounts that win on latency. A bookmaker edge only counts
+if the bet would have been accepted before the market reacted, which is what
+the fixed-odds backtest checks.
 
 **Rules and law.** Trading on public data (live timing, your own TV feed) is
 ordinary fast trading. Getting team radio any other way, such as intercepting
@@ -256,6 +333,7 @@ f1radio/
   study.py       price book, event study, confounders, placebo windows
   backtest.py    execution and fee model, P&L
   recorder.py    live order-book recorder (Polymarket websocket, Kalshi polling)
+  bookmakers.py  odds CSV import, margin removal, Betfair history and live recorder, fixed-odds backtest
   report.py      report.md and charts
   pipeline.py    the steps above, wired to data/<year>_<race>/
 tests/           synthetic fixtures, no network

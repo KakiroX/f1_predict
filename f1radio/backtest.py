@@ -10,7 +10,12 @@ spot of any historical test here:
   half-spread assumption (`poly_half_spread`). Live recordings from
   recorder.py carry real bid/ask for both venues and replace both guesses.
 * Size is capped at a share of what actually traded in the window, since a
-  thin in-race book is the real limit on this strategy.
+  thin in-race book is the real limit on this strategy. Venues without trade
+  data (imported exchange odds) are not capped; `capacity_known` says so.
+* Betting exchanges (Betfair) are traded the same way: back = buy YES at
+  1/back odds, lay = sell YES at 1/lay odds, and commission is charged on net
+  winnings. Fixed-odds bookmakers cannot be exited and are tested in
+  bookmakers.backtest instead.
 """
 from __future__ import annotations
 
@@ -33,6 +38,7 @@ class Params:
     poly_half_spread: float = 0.01
     poly_fee_rate: float = 0.0       # taker fee as a share of notional; check the market's fee schedule
     kalshi_fee_coef: float = 0.07    # Kalshi taker fee: ceil(0.07 * C * P * (1-P)) in cents per order
+    exchange_commission: float = 0.05  # Betfair-style commission on net winnings; check your rate
     min_price: float = 0.03          # skip near-certain markets: nothing left to move
     max_price: float = 0.97
 
@@ -60,10 +66,16 @@ def _fee(venue: str, contracts: float, px: float, prm: Params) -> float:
     return prm.poly_fee_rate * contracts * px
 
 
-def run(es: pd.DataFrame, book: PriceBook, prm: Params = Params()) -> pd.DataFrame:
+def run(es: pd.DataFrame, book: PriceBook, prm: Params = Params(),
+        kinds: dict[str, str] | None = None) -> pd.DataFrame:
+    """`kinds` maps venue -> "exchange" / "bookmaker"; prediction markets need no entry."""
+    kinds = kinds or {}
     trades = []
     for _, e in es[es["direction"] != 0].iterrows():
         key = (e["venue"], int(e["target_driver"]))
+        kind = kinds.get(key[0], "market")
+        if kind == "bookmaker":
+            continue
         mid = e["p_avail"]
         if np.isnan(mid) or not (prm.min_price <= mid <= prm.max_price):
             continue
@@ -77,15 +89,23 @@ def run(es: pd.DataFrame, book: PriceBook, prm: Params = Params()) -> pd.DataFra
         if np.isnan(px_in) or np.isnan(px_out) or px_in <= 0:
             continue
         window_contracts, _, n = book.volume(key, t_in, t_out + pd.Timedelta(seconds=60))
-        cap = prm.participation * window_contracts if not np.isnan(window_contracts) else 0.0
+        capacity_known = book.has_volume(key)
+        if capacity_known:
+            cap = prm.participation * window_contracts if not np.isnan(window_contracts) else 0.0
+        else:
+            cap = math.inf
         contracts = math.floor(min(prm.stake / px_in, cap))
-        fees = _fee(key[0], contracts, px_in, prm) + _fee(key[0], contracts, px_out, prm) if contracts else 0.0
+        gross = contracts * (px_out - px_in)
+        if kind == "exchange":
+            fees = prm.exchange_commission * max(gross, 0.0)
+        else:
+            fees = _fee(key[0], contracts, px_in, prm) + _fee(key[0], contracts, px_out, prm) if contracts else 0.0
         trades.append({
             "venue": key[0], "audio_file": e["audio_file"], "target_driver": key[1],
             "category": e["category"], "side": "YES" if buy_yes else "NO",
             "t_in": t_in, "t_out": t_out, "px_in": px_in, "px_out": px_out,
-            "edge_per_contract": px_out - px_in, "capacity_contracts": cap, "contracts": contracts,
-            "fees": fees, "pnl": contracts * (px_out - px_in) - fees, "window_trades": n,
+            "edge_per_contract": px_out - px_in, "capacity_contracts": cap, "capacity_known": capacity_known,
+            "contracts": contracts, "fees": fees, "pnl": gross - fees, "window_trades": n,
             "confounders": e["confounders"],
         })
     return pd.DataFrame(trades)

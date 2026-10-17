@@ -9,7 +9,7 @@ import pandas as pd
 
 import requests
 
-from . import backtest, broadcast, classify, f1feed, markets, openf1, report, study
+from . import backtest, bookmakers, broadcast, classify, f1feed, markets, openf1, report, study
 
 log = logging.getLogger(__name__)
 
@@ -156,6 +156,69 @@ def align(year: int, race: str, recording: str, wallclock_start: str | None, anc
              out.loc[found, "feed_to_broadcast_s"].median() if found.any() else float("nan"))
 
 
+def _slug(name: str) -> str:
+    return "".join(ch for ch in name.lower() if ch.isalnum()) or "bookmaker"
+
+
+def _update_meta(d: Path, **kv) -> None:
+    meta = json.loads((d / "meta.json").read_text())
+    meta.update(kv)
+    (d / "meta.json").write_text(json.dumps(meta, indent=1))
+
+
+def import_odds(year: int, race: str, path: str, bookmaker: str | None, tz: str | None,
+                kind: str | None) -> None:
+    """Captured odds CSV -> data/<race>/odds_<bookmaker>.csv (run fetch first, for the driver list)."""
+    d = race_dir(year, race)
+    raw = bookmakers.read_odds_csv(Path(path), bookmaker, tz)
+    drivers = load(d / "drivers.csv")
+    for name, g in raw.groupby("bookmaker"):
+        k = kind or ("exchange" if "lay_odds" in g and g["lay_odds"].notna().any() else "bookmaker")
+        venue = _slug(str(name))
+        out = bookmakers.normalise(g, venue, k, drivers)
+        save(out, d / f"odds_{venue}.csv")
+        log.info("%s (%s): %d rows, %d drivers, %s -> %s", venue, k, len(out), out["driver_number"].nunique(),
+                 out["utc"].min(), out["utc"].max())
+
+
+def import_betfair(year: int, race: str, path: str, market_id: str | None) -> None:
+    d = race_dir(year, race)
+    drivers = load(d / "drivers.csv")
+    raw = bookmakers.read_betfair_stream(Path(path), market_id)
+    out = bookmakers.normalise(raw, "betfair", "exchange", drivers)
+    save(out, d / "odds_betfair.csv")
+    log.info("betfair %s: %d rows, %d drivers", raw["market_id"].iloc[0], len(out), out["driver_number"].nunique())
+    if raw.attrs.get("winner"):
+        num = markets.match_driver(raw.attrs["winner"], drivers)
+        if num is not None:
+            _update_meta(d, winner=num)
+            log.info("winner from Betfair settlement: %s (#%s)", raw.attrs["winner"], num)
+
+
+def load_odds(d: Path) -> pd.DataFrame:
+    frames = [load(p) for p in sorted(d.glob("odds_*.csv"))]
+    frames = [f for f in frames if not f.empty]
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+def infer_winner(d: Path, book: study.PriceBook) -> int | None:
+    """meta.json `winner` if set, else the driver every market priced at >= 0.9 after the flag."""
+    meta = json.loads((d / "meta.json").read_text())
+    if meta.get("winner") is not None:
+        return int(meta["winner"])
+    t = race_window(d)[1] + pd.Timedelta(minutes=10)
+    best: dict[int, float] = {}
+    for key in book.series:
+        p = book.price(key, t)
+        if not pd.isna(p):
+            best[key[1]] = max(best.get(key[1], 0.0), p)
+    if best:
+        drv, p = max(best.items(), key=lambda kv: kv[1])
+        if p >= 0.9:
+            return drv
+    return None
+
+
 def radio_table(d: Path) -> pd.DataFrame:
     """radio.csv + transcripts + broadcast times (auto, then manual annotations win) + tags."""
     radio = load(d / "radio.csv")
@@ -177,7 +240,9 @@ def radio_table(d: Path) -> pd.DataFrame:
     return classify.tag(radio, load(d / "drivers.csv"))
 
 
-def analyze(year: int, race: str, t_avail: str, live: str | None, prm: backtest.Params) -> Path:
+def analyze(year: int, race: str, t_avail: str, live: str | None, prm: backtest.Params,
+            bprm: bookmakers.BookieParams | None = None, winner: int | None = None) -> Path:
+    bprm = bprm or bookmakers.BookieParams()
     d = race_dir(year, race)
     drivers = load(d / "drivers.csv")
     if live:
@@ -187,6 +252,14 @@ def analyze(year: int, race: str, t_avail: str, live: str | None, prm: backtest.
         book = study.PriceBook(trades, quotes, quotes_at="asof")
     else:
         book = study.PriceBook(load(d / "trades.csv"), load(d / "minute.csv"))
+    odds = load_odds(d)
+    kinds: dict[str, str] = {}
+    if not odds.empty:
+        book.add_quotes(odds)
+        kinds = odds.groupby("venue")["kind"].first().to_dict()
+    if winner is not None:
+        _update_meta(d, winner=winner)
+    winner = infer_winner(d, book)
     radio = radio_table(d)
     if t_avail == "feed_utc" and radio["feed_utc"].isna().all():
         log.warning("no feed publish times (OpenF1 source); using capture_utc as availability time")
@@ -194,11 +267,14 @@ def analyze(year: int, race: str, t_avail: str, live: str | None, prm: backtest.
     es = study.run(radio, book, t_avail_col=t_avail, default_delay_s=prm.default_delay_s,
                    track_status=load(d / "track_status.csv"), pits=load(d / "pits.csv"),
                    race_control=load(d / "race_control.csv"), race_window=race_window(d))
-    bt = backtest.run(es, book, prm) if not es.empty else pd.DataFrame()
+    bt = backtest.run(es, book, prm, kinds) if not es.empty else pd.DataFrame()
+    fixed = odds[odds["kind"] == "bookmaker"] if not odds.empty else pd.DataFrame()
+    bk = bookmakers.backtest(es, fixed, winner, bprm) if not (es.empty or fixed.empty) else pd.DataFrame()
+    save(bk, d / "backtest_bookmakers.csv")
     save(radio, d / "radio_tagged.csv")
     save(es, d / "event_study.csv")
     save(study.summarise(es) if not es.empty else pd.DataFrame(), d / "event_summary.csv")
     save(bt, d / "backtest.csv")
-    path = report.write(d, radio, es, bt, book, t_avail, prm)
+    path = report.write(d, radio, es, bt, book, t_avail, prm, bk, winner)
     log.info("report: %s", path)
     return path

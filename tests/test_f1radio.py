@@ -250,3 +250,115 @@ def test_polymarket_slug_candidates_pick_year(monkeypatch):
     assert markets.polymarket_event(year=2026, slug=["old-slug", "new-slug"])["slug"] == "new-slug"
     with pytest.raises(LookupError):
         markets.polymarket_event(year=2024, slug=["old-slug", "new-slug"])
+
+
+# --------------------------------------------------------------------------- bookmakers
+
+DRIVERS = pd.DataFrame({"driver_number": [1, 16], "tla": ["VER", "LEC"], "last_name": ["Verstappen", "Leclerc"]})
+
+
+def test_parse_odds_formats():
+    from f1radio.bookmakers import parse_odds
+    assert parse_odds("3.5") == 3.5
+    assert parse_odds("5/2") == 3.5
+    assert parse_odds("+250") == 3.5
+    assert parse_odds("-200") == 1.5
+    assert parse_odds("151") == 151.0  # big decimal longshot, not American
+    assert np.isnan(parse_odds(""))
+
+
+def test_normalise_removes_margin_and_carries_forward():
+    from f1radio.bookmakers import normalise
+    t = pd.Timestamp("2026-10-11T12:00:00Z")
+    raw = pd.DataFrame({"utc": [t, t, t + pd.Timedelta(seconds=5)], "selection": ["Verstappen", "LEC", "VER"],
+                        "odds": ["1.25", "4.0", "2.0"]})
+    out = normalise(raw, "winline", "bookmaker", DRIVERS)
+    first = out[out["utc"] == t].set_index("driver_number")["yes_price"]
+    assert first.sum() == pytest.approx(1.0)
+    assert first[1] == pytest.approx(0.8 / 1.05)
+    later = out[out["utc"] == t + pd.Timedelta(seconds=5)].set_index("driver_number")
+    assert later.loc[16, "odds"] == 4.0  # Leclerc carried forward
+    assert later["implied"].sum() < 1 and later.loc[1, "yes_price"] == pytest.approx(0.5)  # under-round: raw
+
+
+def test_betfair_stream(tmp_path):
+    import bz2
+    from f1radio.bookmakers import normalise, read_betfair_stream
+    pt = int(pd.Timestamp("2026-10-11T12:00:00Z").timestamp() * 1000)
+    md = {"name": "Winner", "status": "OPEN", "inPlay": True,
+          "runners": [{"id": 11, "name": "Max Verstappen", "status": "ACTIVE"},
+                      {"id": 22, "name": "Charles Leclerc", "status": "ACTIVE"}]}
+    msgs = [
+        {"op": "mcm", "pt": pt, "mc": [{"id": "1.5", "marketDefinition": md, "rc": [
+            {"id": 11, "batb": [[0, 1.30, 500]], "batl": [[0, 1.32, 400]]},
+            {"id": 22, "batb": [[0, 4.0, 100]], "batl": [[0, 4.2, 80]]}]}]},
+        {"op": "mcm", "pt": pt + 1000, "mc": [{"id": "1.5", "rc": [{"id": 11, "batb": [[0, 1.30, 0]]}]}]},
+        {"op": "mcm", "pt": pt + 2000, "mc": [{"id": "1.5", "marketDefinition": md | {"status": "SUSPENDED"}}]},
+        {"op": "mcm", "pt": pt + 9000, "mc": [{"id": "1.5", "marketDefinition": md | {
+            "status": "CLOSED", "runners": [{"id": 11, "name": "Max Verstappen", "status": "LOSER"},
+                                            {"id": 22, "name": "Charles Leclerc", "status": "WINNER"}]}}]},
+    ]
+    f = tmp_path / "1.5.bz2"
+    with bz2.open(f, "wt") as fh:
+        fh.write("\n".join(json.dumps(m) for m in msgs))
+    raw = read_betfair_stream(f)
+    assert raw.attrs["winner"] == "Charles Leclerc"
+    out = normalise(raw, "betfair", "exchange", DRIVERS)
+    v0 = out[(out["driver_number"] == 1)].iloc[0]
+    assert v0["ask"] == pytest.approx(1 / 1.30) and v0["bid"] == pytest.approx(1 / 1.32)
+    v1 = out[(out["driver_number"] == 1)].iloc[1]
+    assert np.isnan(v1["odds"]) and v1["lay_odds"] == 1.32  # back side emptied: no stale 1.30
+    susp = out[out["utc"] == pd.Timestamp(pt + 2000, unit="ms", tz="UTC")]
+    assert len(susp) == 2 and susp["suspended"].eq(1).all()  # suspension kept for both runners
+
+
+def winline_csv(path):
+    """Moscow local time, no tz. Verstappen drifts and Leclerc shortens after the radio; suspended 5100-5140."""
+    lines = ["timestamp,selection,odds,suspended"]
+    for sec in range(3600, 10800, 20):
+        if sec < 5040:
+            ver, lec = "1.25", "4.00"
+        else:
+            ver, lec = "3.00", "1.40"
+        susp = int(5100 <= sec < 5140)
+        local = (T0 + pd.Timedelta(seconds=sec)).tz_convert("Europe/Moscow").tz_localize(None).isoformat()
+        lines += [f"{local},Max Verstappen,{ver},{susp}", f"{local},Charles Leclerc,{lec},{susp}"]
+    path.write_text("\n".join(lines) + "\n")
+
+
+def test_bookmaker_end_to_end(fake_net):
+    d = pipeline.fetch(2026, "singapore")
+    (d / "transcripts.csv").write_text("audio_file,text\nVER_b.mp3,\"I've lost power\"\n")
+    ann = pipeline.ANNOTATIONS / f"{d.name}_broadcast.csv"
+    ann.parent.mkdir(parents=True)
+    ann.write_text(f"audio_file,broadcast_utc\nVER_b.mp3,{utc(AIR)}\n")
+    winline_csv(fake_net / "winline.csv")
+    pipeline.import_odds(2026, "singapore", str(fake_net / "winline.csv"), "Winline", "Europe/Moscow", None)
+    odds = pipeline.load(d / "odds_winline.csv")
+    assert odds["kind"].eq("bookmaker").all()
+    assert odds["utc"].min() == T0 + pd.Timedelta(seconds=3600)  # Moscow time converted to UTC
+
+    pipeline.analyze(2026, "singapore", "feed_utc", None, backtest.Params(), winner=16)
+    bk = pipeline.load(d / "backtest_bookmakers.csv")
+    bet = bk.iloc[0]
+    assert bet["backed"] == 16 and bet["status"] == "accepted"  # bad news for VER: back Leclerc
+    assert bet["odds_taken"] == 4.0
+    assert bet["settled_pnl"] == pytest.approx(300.0)  # 100 at 4.0 on the winner
+    assert bet["ev_after_broadcast"] > 100
+    # winline is not traded in and out like a market
+    assert "winline" not in set(pipeline.load(d / "backtest.csv")["venue"])
+    es = pipeline.load(d / "event_study.csv")
+    assert "winline" in set(es["venue"])
+    assert "Fixed-odds bookmakers" in (d / "report.md").read_text()
+
+
+def test_bookmaker_rejects_when_suspended():
+    from f1radio.bookmakers import BookieParams, backtest as bk_backtest
+    t = pd.Timestamp("2026-10-11T12:00:00Z")
+    odds = pd.DataFrame({"utc": [t, t], "venue": "winline", "kind": "bookmaker", "driver_number": [1, 16],
+                         "odds": [1.25, 4.0], "suspended": [1, 1], "yes_price": [0.76, 0.24]})
+    es = pd.DataFrame({"audio_file": ["a"], "direction": [-1], "target_driver": [1], "category": ["failure"],
+                       "t_avail": [t + pd.Timedelta(seconds=1)], "broadcast_utc": [t + pd.Timedelta(seconds=90)],
+                       "confounders": [""]})
+    out = bk_backtest(es, odds, winner=16, prm=BookieParams())
+    assert out["status"].iloc[0] == "suspended"

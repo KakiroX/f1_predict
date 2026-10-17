@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from . import backtest, study
+from . import backtest, bookmakers, study
 
 log = logging.getLogger(__name__)
 
@@ -73,7 +73,8 @@ def plot_events(d: Path, es: pd.DataFrame, book: study.PriceBook, top: int = 12)
 
 
 def write(d: Path, radio: pd.DataFrame, es: pd.DataFrame, bt: pd.DataFrame, book: study.PriceBook,
-          t_avail: str, prm: backtest.Params) -> Path:
+          t_avail: str, prm: backtest.Params, bk: pd.DataFrame | None = None,
+          winner: int | None = None) -> Path:
     lines = [f"# Radio vs. winner markets: {d.name}\n"]
     meta_path = d / "meta.json"
     source = json.loads(meta_path.read_text()).get("source", "f1") if meta_path.exists() else "f1"
@@ -112,6 +113,16 @@ def write(d: Path, radio: pd.DataFrame, es: pd.DataFrame, bt: pd.DataFrame, book
     if not bt.empty:
         lines.append(md_table(bt.sort_values("pnl")[["venue", "target_driver", "category", "side", "px_in",
                                                      "px_out", "contracts", "fees", "pnl", "confounders"]]))
+    if bk is not None and not bk.empty:
+        lines.append("## Fixed-odds bookmakers\n")
+        lines.append(f"Back-only bets, accepted after the in-play delay, never exited. Winner used for "
+                     f"settlement: {'#' + str(winner) if winner else 'unknown (pass --winner)'}. "
+                     "`ev_after_broadcast` values each ticket at the bookmaker's own fair price once the "
+                     "clip has aired; it is the measure that does not depend on who happened to win.\n")
+        lines.append(md_table(bookmakers.summarise(bk)))
+        cols = ["venue", "category", "target_driver", "backed", "status", "odds_request", "odds_taken",
+                "fair_p_at_bet", "fair_p_after_broadcast", "ev_after_broadcast", "settled_pnl", "confounders"]
+        lines.append(md_table(bk[[c for c in cols if c in bk]]))
     charts = plot_events(d, es, book) if not es.empty else []
     if charts:
         lines.append("## Charts\n")

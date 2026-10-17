@@ -5,7 +5,7 @@ import argparse
 import logging
 from pathlib import Path
 
-from . import backtest, pipeline
+from . import backtest, bookmakers, pipeline
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -43,6 +43,30 @@ def main(argv: list[str] | None = None) -> None:
     for f in ("reaction_s", "hold_s", "default_delay_s", "stake", "participation", "poly_half_spread",
               "poly_fee_rate"):
         p.add_argument("--" + f.replace("_", "-"), type=float, default=getattr(backtest.Params, f))
+    p.add_argument("--exchange-commission", type=float, default=backtest.Params.exchange_commission)
+    p.add_argument("--acceptance-delay", type=float, default=bookmakers.BookieParams.acceptance_delay_s,
+                   help="bookmaker in-play bet delay in seconds")
+    p.add_argument("--bookie-stake", type=float, default=bookmakers.BookieParams.stake)
+    p.add_argument("--max-stake", type=float, default=bookmakers.BookieParams.max_stake,
+                   help="largest in-play bet the bookmaker would accept")
+    p.add_argument("--winner", type=int, help="winning car number, for settling bookmaker bets")
+
+    p = race_args(sub.add_parser("import-odds", help="odds you captured from any bookmaker (CSV)"))
+    p.add_argument("--file", required=True)
+    p.add_argument("--bookmaker", help="name, if the CSV has no bookmaker column")
+    p.add_argument("--tz", help="time zone of naive timestamps, e.g. Europe/Moscow (default UTC)")
+    p.add_argument("--kind", choices=["bookmaker", "exchange"],
+                   help="default: exchange if the CSV has lay_odds, else bookmaker")
+
+    p = race_args(sub.add_parser("import-betfair", help="Betfair historical stream file (.bz2)"))
+    p.add_argument("--file", required=True)
+    p.add_argument("--market-id", help="needed if the file holds several markets")
+
+    p = sub.add_parser("record-betfair", help="poll a Betfair market live into an odds CSV")
+    p.add_argument("--market-id", required=True)
+    p.add_argument("--out", required=True)
+    p.add_argument("--interval", type=float, default=1.0)
+    p.add_argument("--api", default=bookmakers.BETFAIR_API, help="regional API base URL if not .com")
 
     p = race_args(sub.add_parser("all", help="fetch + audio + analyze"))
     p.add_argument("--poly-slug")
@@ -69,8 +93,21 @@ def main(argv: list[str] | None = None) -> None:
     elif a.cmd == "analyze":
         prm = backtest.Params(**{f: getattr(a, f) for f in ("reaction_s", "hold_s", "default_delay_s", "stake",
                                                              "participation", "poly_half_spread",
-                                                             "poly_fee_rate")})
-        pipeline.analyze(a.year, a.race, a.t_avail, a.live, prm)
+                                                             "poly_fee_rate", "exchange_commission")})
+        bprm = bookmakers.BookieParams(reaction_s=a.reaction_s, acceptance_delay_s=a.acceptance_delay,
+                                       hold_s=a.hold_s, stake=a.bookie_stake, max_stake=a.max_stake)
+        pipeline.analyze(a.year, a.race, a.t_avail, a.live, prm, bprm, a.winner)
+    elif a.cmd == "import-odds":
+        pipeline.import_odds(a.year, a.race, a.file, a.bookmaker, a.tz, a.kind)
+    elif a.cmd == "import-betfair":
+        pipeline.import_betfair(a.year, a.race, a.file, a.market_id)
+    elif a.cmd == "record-betfair":
+        import os
+
+        key, token = os.environ.get("BETFAIR_APP_KEY"), os.environ.get("BETFAIR_SESSION_TOKEN")
+        if not (key and token):
+            raise SystemExit("set BETFAIR_APP_KEY and BETFAIR_SESSION_TOKEN")
+        bookmakers.record_betfair(a.market_id, Path(a.out), key, token, a.interval, a.api)
     elif a.cmd == "all":
         pipeline.fetch(a.year, a.race, a.poly_slug, a.kalshi_event)
         pipeline.audio(a.year, a.race)
