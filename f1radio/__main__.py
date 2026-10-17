@@ -19,7 +19,9 @@ def main(argv: list[str] | None = None) -> None:
 
     p = race_args(sub.add_parser("fetch", help="F1 archive + Polymarket/Kalshi history"))
     p.add_argument("--poly-slug", help="Polymarket event slug if search does not find it")
-    p.add_argument("--kalshi-event", help="Kalshi event ticker, e.g. KXF1RACE-SINGP26")
+    p.add_argument("--kalshi-event", help="Kalshi event ticker, e.g. KXF1RACE-SIN26")
+    p.add_argument("--source", default="auto", choices=["auto", "f1", "openf1"],
+                   help="race data: F1 archive, OpenF1, or archive with OpenF1 fallback (default)")
 
     race_args(sub.add_parser("audio", help="download radio MP3s"))
 
@@ -56,7 +58,7 @@ def main(argv: list[str] | None = None) -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
     if a.cmd == "fetch":
-        pipeline.fetch(a.year, a.race, a.poly_slug, a.kalshi_event)
+        pipeline.fetch(a.year, a.race, a.poly_slug, a.kalshi_event, source=a.source)
     elif a.cmd == "audio":
         pipeline.audio(a.year, a.race)
     elif a.cmd == "transcribe":

@@ -1,6 +1,7 @@
 """Markdown report (and price charts if matplotlib is installed) for one race."""
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import asdict
 from pathlib import Path
@@ -74,7 +75,14 @@ def plot_events(d: Path, es: pd.DataFrame, book: study.PriceBook, top: int = 12)
 def write(d: Path, radio: pd.DataFrame, es: pd.DataFrame, bt: pd.DataFrame, book: study.PriceBook,
           t_avail: str, prm: backtest.Params) -> Path:
     lines = [f"# Radio vs. winner markets: {d.name}\n"]
-    lines.append(f"Availability time used: `{t_avail}`. Backtest params: `{asdict(prm)}`\n")
+    meta_path = d / "meta.json"
+    source = json.loads(meta_path.read_text()).get("source", "f1") if meta_path.exists() else "f1"
+    lines.append(f"Race data source: `{source}`. Availability time used: `{t_avail}`. "
+                 f"Backtest params: `{asdict(prm)}`\n")
+    if source == "openf1":
+        lines.append("> OpenF1 has no feed publish times, so availability = the moment the clip was "
+                     "recorded. That is the best case for a trader, not what a public-data trader "
+                     "could actually do.\n")
     lines.append("## Timing chain\n")
     lines.append(f"- spoken -> live-timing feed: {_dist(radio['feed_lag_s'])}")
     if radio["broadcast_utc"].notna().any():

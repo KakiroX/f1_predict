@@ -7,11 +7,21 @@ from pathlib import Path
 
 import pandas as pd
 
-from . import backtest, broadcast, classify, f1feed, markets, report, study
+import requests
+
+from . import backtest, broadcast, classify, f1feed, markets, openf1, report, study
 
 log = logging.getLogger(__name__)
 
 RACES = {"singapore": "Singapore", "baku": "Azerbaijan"}
+# Market ids found by browsing the venues. --kalshi-event / --poly-slug override them.
+# Polymarket has two Baku winner listings (one misspelled); the one dated in the
+# requested year is used.
+MARKET_IDS = {
+    (2026, "baku"): {"kalshi": "KXF1RACE-AZEGP26",
+                     "poly": ["f1-azerbaijan-grand-prix-winner", "azerbijan-grand-prix-winner"]},
+    (2026, "singapore"): {"kalshi": "KXF1RACE-SIN26"},
+}
 DATA = Path("data")
 ANNOTATIONS = Path("annotations")
 
@@ -45,10 +55,27 @@ def race_window(d: Path) -> tuple[pd.Timestamp, pd.Timestamp]:
 
 # --------------------------------------------------------------------------- steps
 
+def fetch_f1(year: int, query: str, source: str = "auto") -> dict:
+    """F1 archive first; OpenF1 if the archive refuses (it has answered 401 since late 2026)."""
+    if source in ("auto", "f1"):
+        try:
+            return f1feed.fetch_all(year, query) | {"source": "f1"}
+        except requests.HTTPError as exc:
+            status = getattr(exc.response, "status_code", None)
+            if source == "f1" or status not in (401, 403):
+                raise
+            log.warning("F1 archive answered %s; falling back to OpenF1. Feed publish times will be "
+                        "missing, so the analysis uses the recording time as availability time.", status)
+    return openf1.fetch_all(year, query)
+
+
 def fetch(year: int, race: str, poly_slug: str | None = None, kalshi_event: str | None = None,
-          pad_min: int = 30) -> Path:
+          pad_min: int = 30, source: str = "auto") -> Path:
     d = race_dir(year, race)
-    f1 = f1feed.fetch_all(year, RACES.get(race, race))
+    ids = MARKET_IDS.get((year, race), {})
+    poly_slug = poly_slug or ids.get("poly")
+    kalshi_event = kalshi_event or ids.get("kalshi")
+    f1 = fetch_f1(year, RACES.get(race, race), source)
     for name in ("drivers", "radio", "track_status", "session_status", "race_control", "laps", "pits"):
         save(f1[name], d / f"{name}.csv")
 
@@ -59,7 +86,8 @@ def fetch(year: int, race: str, poly_slug: str | None = None, kalshi_event: str 
     end = finished.iloc[0] if len(finished) else start + pd.Timedelta(hours=2, minutes=30)
     s = f1["session"]
     (d / "meta.json").write_text(json.dumps({
-        "year": year, "race": race, "meeting": s.meeting, "path": s.path, "stream_t0_utc": str(f1["t0"]),
+        "year": year, "race": race, "source": f1["source"], "meeting": s.meeting, "path": s.path,
+        "stream_t0_utc": str(f1["t0"]),
         "race_start_utc": str(start), "race_end_utc": str(end),
     }, indent=1))
     log.info("%s: %d radio clips, race %s -> %s", s.meeting, len(f1["radio"]), start, end)
@@ -79,9 +107,18 @@ def audio(year: int, race: str) -> None:
 
     d = race_dir(year, race)
     radio = load(d / "radio.csv")
+    failed: dict[str, int] = {}
     for _, r in radio.iterrows():
-        download(r["audio_url"], d / "audio" / r["audio_file"])
-    log.info("downloaded %d clips to %s", len(radio), d / "audio")
+        try:
+            download(r["audio_url"], d / "audio" / r["audio_file"])
+        except requests.RequestException as exc:
+            code = str(getattr(getattr(exc, "response", None), "status_code", None) or type(exc).__name__)
+            failed[code] = failed.get(code, 0) + 1
+    log.info("downloaded %d/%d clips to %s", len(radio) - sum(failed.values()), len(radio), d / "audio")
+    if failed:
+        log.error("failed downloads by reason: %s. The clips are hosted on livetiming.formula1.com; "
+                  "without them, type transcripts into transcripts.csv and broadcast times into "
+                  "annotations/ by hand.", failed)
 
 
 def transcribe(year: int, race: str, model: str) -> None:
@@ -151,6 +188,9 @@ def analyze(year: int, race: str, t_avail: str, live: str | None, prm: backtest.
     else:
         book = study.PriceBook(load(d / "trades.csv"), load(d / "minute.csv"))
     radio = radio_table(d)
+    if t_avail == "feed_utc" and radio["feed_utc"].isna().all():
+        log.warning("no feed publish times (OpenF1 source); using capture_utc as availability time")
+        t_avail = "capture_utc"
     es = study.run(radio, book, t_avail_col=t_avail, default_delay_s=prm.default_delay_s,
                    track_status=load(d / "track_status.csv"), pits=load(d / "pits.csv"),
                    race_control=load(d / "race_control.csv"), race_window=race_window(d))

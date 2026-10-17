@@ -189,3 +189,64 @@ def test_pricebook_candles_and_asof():
     assert candles.quote(("kalshi", 1), t + pd.Timedelta(seconds=20)) == (0.5, 0.55)  # candle ending 12:01
     live = study.PriceBook(pd.DataFrame(), q, quotes_at="asof")
     assert live.quote(("kalshi", 1), t + pd.Timedelta(seconds=20)) == (0.4, 0.45)
+
+
+def fake_openf1(url, params=None, cache=True):
+    ep = url.rsplit("/", 1)[-1]
+    if ep == "sessions":
+        return [{"session_key": 9999, "session_name": "Race", "country_name": "Singapore",
+                 "location": "Marina Bay", "date_start": utc(3600), "date_end": utc(10800)}]
+    if ep == "drivers":
+        return [{"driver_number": 1, "name_acronym": "VER", "first_name": "Max", "last_name": "Verstappen"},
+                {"driver_number": 16, "name_acronym": "LEC", "first_name": "Charles", "last_name": "Leclerc"}]
+    if ep == "team_radio":
+        return [{"driver_number": 1, "date": utc(SPOKEN), "recording_url": f1feed.BASE + PATH + "TeamRadio/VER_b.mp3"}]
+    if ep == "race_control":
+        return [{"date": utc(4000), "category": "SafetyCar", "flag": None, "message": "SAFETY CAR DEPLOYED"},
+                {"date": utc(4100), "category": "Flag", "flag": "CLEAR", "message": "CLEAR IN TRACK SECTOR 4"},
+                {"date": utc(10700), "category": "Flag", "flag": "CHEQUERED", "message": "CHEQUERED FLAG"}]
+    if ep == "laps":
+        return [{"driver_number": 1, "lap_number": 1, "date_start": None},
+                {"driver_number": 1, "lap_number": 2, "date_start": utc(3700)},
+                {"driver_number": 16, "lap_number": 2, "date_start": utc(3702)}]
+    if ep == "pit":
+        return []
+    raise AssertionError(url)
+
+
+def test_openf1_fallback_on_401(fake_net, monkeypatch):
+    import requests
+
+    def refuse(*a, **k):
+        raise requests.HTTPError("401", response=type("R", (), {"status_code": 401})())
+
+    monkeypatch.setattr(f1feed, "get_text", refuse)
+    monkeypatch.setattr(f1feed, "get_json", refuse)
+    from f1radio import openf1
+    monkeypatch.setattr(openf1, "get_json", fake_openf1)
+
+    d = pipeline.fetch(2026, "singapore")
+    meta = json.loads((d / "meta.json").read_text())
+    assert meta["source"] == "openf1"
+    assert pd.Timestamp(meta["race_end_utc"]) == pd.Timestamp(utc(10700))
+    ts = pipeline.load(d / "track_status.csv")
+    assert list(ts["message"]) == ["SAFETY CAR DEPLOYED"]  # sector clears are not track status
+    assert pipeline.load(d / "laps.csv")["feed_utc"].iloc[0] == pd.Timestamp(utc(3700))
+
+    (d / "transcripts.csv").write_text("audio_file,text\nVER_b.mp3,\"lost power\"\n")
+    pipeline.analyze(2026, "singapore", "feed_utc", None, backtest.Params())
+    es = pipeline.load(d / "event_study.csv")
+    assert es["t_avail"].iloc[0] == pd.Timestamp(utc(SPOKEN))  # fell back to capture time
+    assert "openf1" in (d / "report.md").read_text()
+
+    with pytest.raises(requests.HTTPError):
+        pipeline.fetch(2026, "singapore", source="f1")
+
+
+def test_polymarket_slug_candidates_pick_year(monkeypatch):
+    events = {"old-slug": [{"slug": "old-slug", "endDate": "2025-09-21T12:00:00Z", "markets": []}],
+              "new-slug": [{"slug": "new-slug", "endDate": "2026-09-26T12:00:00Z", "markets": []}]}
+    monkeypatch.setattr(markets, "get_json", lambda url, params=None, cache=True: events.get(params["slug"], []))
+    assert markets.polymarket_event(year=2026, slug=["old-slug", "new-slug"])["slug"] == "new-slug"
+    with pytest.raises(LookupError):
+        markets.polymarket_event(year=2024, slug=["old-slug", "new-slug"])

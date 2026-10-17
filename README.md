@@ -8,10 +8,14 @@ to the winner-market prices on Polymarket and Kalshi on one UTC clock. It then
 measures how much the price moved between "a fast trader could know" and
 "everyone watching TV knows", and backtests trading that gap after spread and fees.
 
-> **Status: the pipeline has not been run on real data yet.** The session that
-> built it had no network access to the F1, Polymarket or Kalshi APIs. The tests
-> use synthetic fixtures to check the code; they say nothing about the markets.
-> Run the commands below on a machine with internet access.
+> **Status: the pipeline has not been run on real data yet.** The tests use
+> synthetic fixtures to check the code; they say nothing about the markets.
+>
+> **The F1 archive is closed.** Since October 2026, `livetiming.formula1.com`
+> answers `401 Unauthorized` for every season (2024-2026), including the radio
+> MP3s. `fetch` now falls back to [OpenF1](https://openf1.org) automatically.
+> See [What changes on OpenF1](#what-changes-on-openf1). Polymarket and Kalshi
+> both answer normally.
 
 ## Before you run: network access
 
@@ -19,8 +23,8 @@ The pipeline needs HTTPS access to these hosts:
 
 | Host | Used for |
 |---|---|
-| `livetiming.formula1.com` | F1 archive: radio clips, publish times, track status, laps |
-| `api.openf1.org` | optional cross-check of radio timestamps |
+| `livetiming.formula1.com` | F1 archive: radio clips, publish times, track status, laps. **Currently answers 401.** |
+| `api.openf1.org` | race data when the archive refuses (radio times, race control, laps, pits, drivers) |
 | `gamma-api.polymarket.com` | Polymarket event and market lookup |
 | `data-api.polymarket.com` | Polymarket trades |
 | `clob.polymarket.com` | Polymarket 1-minute price history |
@@ -44,8 +48,8 @@ managers" ticked. Steps:
 
 | Instant | Source | How it is measured |
 |---|---|---|
-| `capture_utc` | `Utc` field of each TeamRadio capture in the F1 archive | read directly |
-| `feed_utc` | publish offset of that capture in `TeamRadio.jsonStream`, converted to UTC with `Heartbeat` | read directly |
+| `capture_utc` | `Utc` field of each TeamRadio capture in the F1 archive (OpenF1: `date`, the same value) | read directly |
+| `feed_utc` | publish offset of that capture in `TeamRadio.jsonStream`, converted to UTC with `Heartbeat` | read directly; **not available from OpenF1** |
 | `broadcast_utc` | the TV broadcast | cross-correlate each radio MP3 against the broadcast audio (`align`), or enter it by hand in `annotations/` |
 | market prices | Polymarket trades (to the second) + 1-min history; Kalshi trades + 1-min bid/ask candles | APIs, see `f1radio/markets.py` |
 
@@ -54,16 +58,55 @@ inside the window that starts when you can know and ends when the clip airs.
 `move_window` in the output is that move, signed so that positive means "moved
 the way the message predicted".
 
+## What changes on OpenF1
+
+`fetch --source auto` (the default) tries the F1 archive and switches to
+OpenF1 when it answers 401 or 403. Use `--source openf1` to skip the archive,
+or `--source f1` to fail instead of falling back. `meta.json` and `report.md`
+record which source was used.
+
+| | F1 archive | OpenF1 |
+|---|---|---|
+| when the clip was recorded (`capture_utc`) | yes | yes, same timestamp |
+| when F1 published it to the live feed (`feed_utc`) | yes | **no** |
+| safety car / VSC / red flag | TrackStatus topic | derived from race-control messages |
+| race start / end | SessionStatus topic | scheduled start, chequered-flag message |
+| lap counter (for the `lap:N` anchor) | LapCount topic | earliest lap start across drivers |
+| radio MP3s | yes | links point to the archive, so they **fail with 401 too** |
+
+What that means for the analysis:
+
+- **No feed publish time.** `analyze` uses the recording time as the
+  availability time and says so in the report. That is the best case for a
+  trader (hearing the clip as it is spoken), not what someone watching
+  public data could do. The spoken -> feed delay, hypothesis 1 below, cannot
+  be measured from OpenF1. The spoken -> TV delay, the gap your question is
+  about, still can.
+- **No audio, as long as the archive refuses.** `audio` reports how many clips
+  failed and why. Without the MP3s, `transcribe` and `align` have nothing to
+  work on. Instead:
+  - type what each message says into `data/<year>_<race>/transcripts.csv`
+    (columns `audio_file,text`, one row per clip in `radio.csv`), and
+  - note when each clip aired in a replay and enter it in
+    `annotations/<year>_<race>_broadcast.csv` (see `TEMPLATE_broadcast.csv`).
+
+  Only the clips that matter for the winner market need this: radio from the
+  leader and whoever is close behind in the last part of the race.
+
 ## Run it
+
+On Windows, run these in PowerShell from the repo folder (put the `align`
+command on one line, without the trailing `\`).
 
 ```bash
 pip install -r requirements.txt          # ffmpeg is also needed for `align`
+python -m pytest                         # 10 tests, no network
 
-# 1. F1 archive (radio, track status, race control, laps, pits) + both markets
+# 1. Race data (F1 archive, or OpenF1 when the archive refuses) + both markets.
+#    Market ids for Baku and Singapore 2026 are built in (see below).
 python -m f1radio fetch --year 2026 --race baku
 python -m f1radio fetch --year 2026 --race singapore
-#    If market search misses, pass ids: --poly-slug <event-slug> --kalshi-event KXF1RACE-<code>
-#    (Kalshi race-winner series is KXF1RACE, e.g. KXF1RACE-MIAGP26 was Miami 2026)
+#    For other races, or to override: --kalshi-event KXF1RACE-<code> --poly-slug <slug>
 
 # 2. Radio audio + transcripts (check and correct the transcripts by hand)
 python -m f1radio audio --year 2026 --race baku
@@ -89,20 +132,26 @@ Output goes to `data/<year>_<race>/`: `event_study.csv`, `event_summary.csv`,
 commands run on other races. Two races is too few to conclude much, so run it
 on more.
 
-### Market identifiers that are not confirmed
+### Market identifiers
 
-- **Kalshi:** the race-winner series ticker `KXF1RACE` and the event format
-  (`KXF1RACE-MIAGP26` for Miami 2026) come from
-  [third-party listings](https://simplefunctions.dev/markets/miami-grand-prix-winner-lance-stroll-kalshi-kxf1race-miagp26-str),
-  not from Kalshi's docs. The Singapore and Baku codes are not known.
-- **Polymarket:** the exact event names and slugs for F1 winner markets are
-  not known. `fetch` searches for "<race> Grand Prix ... Winner" in the right year.
-- **Polymarket fees:** the backtest assumes 0 fees on Polymarket. Check the
-  fee schedule of the market you trade and pass `--poly-fee-rate`.
+Found by querying both venues; built into `MARKET_IDS` in `f1radio/pipeline.py`:
 
-If the automatic search misses a market, open it on the website and pass its
-id: `--kalshi-event <event ticker>` or `--poly-slug <slug from the URL>`.
-`fetch` logs every market it could not match to a driver.
+| Race | Kalshi event | Polymarket slug |
+|---|---|---|
+| Baku 2026 | `KXF1RACE-AZEGP26` | `f1-azerbaijan-grand-prix-winner` or `azerbijan-grand-prix-winner` (sic) |
+| Singapore 2026 | `KXF1RACE-SIN26` | not known; `fetch` searches for it |
+
+Polymarket has two Baku winner listings, and it is not yet confirmed which one
+is the 2026 race. `fetch` checks both and uses the one dated 2026; the log line
+`Polymarket event: ...` says which. If neither is, it stops with the dates it found.
+
+Kalshi's race-winner series is `KXF1RACE`. Event codes do not follow one
+pattern (`AZEGP26`, `SIN26`, `MIAGP26`), so for other races look the ticker up
+on Kalshi and pass `--kalshi-event`. For Polymarket, pass `--poly-slug` with the
+slug from the event URL. `fetch` logs every market it could not match to a driver.
+
+The backtest assumes 0 fees on Polymarket. Check the fee schedule of the
+market you trade and pass `--poly-fee-rate`.
 
 ### Tagging messages
 
@@ -154,7 +203,8 @@ These are hypotheses for the pipeline to confirm or reject, not results.
    `capture_utc` and `feed_utc`. Nobody outside the teams and FOM can hear the
    radio in that period. The first thing to check in `report.md` is the
    *spoken → feed* and *feed → TV* distributions. If spoken → feed is the
-   large one, a public-data trader has no radio edge.
+   large one, a public-data trader has no radio edge. While the archive
+   refuses requests, history cannot answer this: OpenF1 has no publish times.
 2. **What a public-data trader can still have is stream latency.** Most
    bettors watch an OTT stream 20–60 s behind the world feed, and the
    live-timing feed usually runs ahead of OTT. That edge is smaller, and
@@ -198,6 +248,7 @@ persons, and Winline is licensed only in Russia.
 ```
 f1radio/
   f1feed.py      F1 static archive: index, .jsonStream parsing, Heartbeat clock, radio/track/RC/laps/pits
+  openf1.py      the same tables from api.openf1.org, used when the archive refuses
   markets.py     Polymarket (gamma, data-api, clob) and Kalshi (KXF1RACE) history, driver matching
   transcribe.py  faster-whisper transcripts (optional)
   classify.py    rule-based message tags

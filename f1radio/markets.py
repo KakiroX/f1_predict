@@ -51,18 +51,33 @@ def _ts(t: pd.Timestamp) -> int:
 
 # --------------------------------------------------------------------------- Polymarket
 
-def polymarket_event(query: str | None = None, year: int | None = None, slug: str | None = None) -> dict:
-    """Find the race-winner event by slug (most reliable) or by text search."""
+def _event_year(ev: dict) -> str:
+    return " ".join(str(ev.get(k) or "") for k in ("endDate", "startDate", "title", "slug"))
+
+
+def polymarket_event(query: str | None = None, year: int | None = None,
+                     slug: str | list[str] | None = None) -> dict:
+    """Find the race-winner event by slug (most reliable) or by text search.
+
+    `slug` may be a list of candidates (Polymarket has duplicate and misspelled
+    listings); the first one whose dates fall in `year` wins.
+    """
     if slug:
-        events = get_json(f"{GAMMA}/events", {"slug": slug})
-        if events:
-            return events[0]
-        raise LookupError(f"no Polymarket event with slug {slug!r}")
+        slugs = [slug] if isinstance(slug, str) else list(slug)
+        found = []
+        for sl in slugs:
+            found += get_json(f"{GAMMA}/events", {"slug": sl}) or []
+        for ev in found:
+            if year is None or str(year) in _event_year(ev):
+                log.info("Polymarket event: %s (%s)", ev.get("title"), ev.get("slug"))
+                return ev
+        raise LookupError(f"no Polymarket event in {year} among slugs {slugs}; "
+                          f"found: {[(e.get('slug'), e.get('endDate')) for e in found]}")
     res = get_json(f"{GAMMA}/public-search", {"q": query, "events_status": "closed", "limit_per_type": 50})
     q = [_norm(w) for w in query.split()]
     for ev in res.get("events", []):
         title = _norm(ev.get("title", ""))
-        same_year = year is None or str(year) in (ev.get("endDate", "") + ev.get("title", "") + ev["slug"])
+        same_year = year is None or str(year) in _event_year(ev)
         if all(w in title for w in q) and "winner" in title and same_year:
             # Search results are abbreviated; refetch for the full market list.
             return get_json(f"{GAMMA}/events", {"slug": ev["slug"]})[0]
@@ -213,7 +228,8 @@ def kalshi_candles(series: str, ticker: str, start: pd.Timestamp, end: pd.Timest
 # --------------------------------------------------------------------------- both
 
 def fetch_all(query: str, year: int, drivers: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp,
-              poly_slug: str | None = None, kalshi_event_ticker: str | None = None) -> dict[str, pd.DataFrame]:
+              poly_slug: str | list[str] | None = None,
+              kalshi_event_ticker: str | None = None) -> dict[str, pd.DataFrame]:
     """Fetch everything for one race. A venue that fails is logged and skipped."""
     markets, trades, minute = [], [], []
 
